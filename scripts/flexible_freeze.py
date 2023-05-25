@@ -66,7 +66,8 @@ parser.add_argument("-l", "--log", dest="logfile")
 parser.add_argument("--lock-timeout", type=int, dest="lock_timeout",
                     help="If VACUUM can't get a lock on a table after this many milliseconds, give up and move on to the next table (prevents VACUUM from waiting on existing autovacuums)")
 parser.add_argument("-v", "--verbose", action="store_true",
-                    dest="verbose")
+                    dest="verbose",
+                    help="print verbose messages about this script's operation; also invoke VACUUM with the VERBOSE option")
 parser.add_argument("--debug", action="store_true",
                     dest="debug")
 parser.add_argument("-U", "--user", dest="dbuser",
@@ -134,6 +135,19 @@ def signal_handler(signal, frame):
             verbose_print('could not clean up db connections')
         
     sys.exit(0)
+
+def print_any_notices(connection, previous_line=None):
+    last_notice_seen = None
+
+    for line in connection.notices:
+        last_notice_seen = line
+        if previous_line is not None and line == previous_line:
+            pass
+        else:
+            print(line, end='')
+
+    return last_notice_seen
+
 
 # startup debugging info
 
@@ -249,7 +263,7 @@ for db in dblist:
                 AND ( (now() - last_vacuum) > INTERVAL '1 hour'
                     OR last_vacuum IS NULL )
             )
-            SELECT full_table_name
+            SELECT full_table_name, size_pretty
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes >= {0} * 2 ^ 20
@@ -258,9 +272,12 @@ for db in dblist:
     # if freezing, get list of top tables to freeze
     # includes TOAST tables in case the toast table has older rows
         tabquery = """WITH tabfreeze AS (
-                SELECT pg_class.oid::regclass AS full_table_name,
-                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
-                pg_relation_size(pg_class.oid) as table_bytes
+                SELECT pg_class.oid::regclass AS full_table_name, -- [0]
+                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age, -- [1]
+                pg_relation_size(pg_class.oid) as table_bytes, -- [2]
+                pg_size_pretty(pg_relation_size(pg_class.oid)) as size_pretty, -- [3]
+                pg_size_pretty(pg_relation_size(pg_class.oid)) as total_size_pretty, -- [4]
+                pg_class.reltuples AS estimated_rows -- [5]
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
@@ -268,7 +285,7 @@ for db in dblist:
                 AND nspname NOT LIKE 'pg_temp%'
                 AND pg_class.relkind = 'r'
             )
-            SELECT full_table_name
+            SELECT full_table_name, freeze_age, table_bytes, size_pretty, total_size_pretty, estimated_rows
             FROM tabfreeze
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
@@ -279,6 +296,8 @@ for db in dblist:
     verbose_print("getting list of tables")
 
     table_resultset = cur.fetchall()
+    debug_print('table_resultset: {}'.format(table_resultset))
+
     tablist = map(lambda row: row[0], table_resultset)
 
     #if only one table is desired
@@ -298,9 +317,9 @@ for db in dblist:
             debug_print("examining table {t} (xid age: {a}  heap size: {s}  row estimate: {r})".format(t=table, a=table_resultset[i][1], s=table_resultset[i][2], r=table_resultset[i][4]))
 
         if db in database_table_map and table in database_table_map[db]:
-            debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
+            verbose_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
             continue
-    # check time; if overtime, exit
+        # check time; if overtime, exit
         elif args.tables_to_exclude and (table in args.tables_to_exclude):
             verbose_print(
                 "skipping table {t} per --exclude-table argument".format(t=table))
@@ -327,6 +346,19 @@ for db in dblist:
         
         exquery += '"%s"' % table
 
+        vac_args = []
+        if args.verbose:
+            vac_args.append("VERBOSE")
+        if not args.skip_freeze:
+            vac_args.append("FREEZE")
+        if not args.skip_analyze:
+            vac_args.append("ANALYZE")
+
+
+        exquery = "VACUUM ({vargs}) {table}".format(
+            table=table,
+            vargs = ", ".join(vac_args))
+        
         verbose_print("%s in database %s" % (exquery, db,))
         excur = conn.cursor()
 
@@ -342,19 +374,35 @@ for db in dblist:
 
                 excur.execute(exquery)
 
+                # Print query rows *and* notices until there are no more of either.
+                prev_notice = None
+                while True:
+                    prev_notice = print_any_notices(conn, prev_notice)
+                    row = cur.fetchone()
+                    if not row:
+                        # A false value means we've reached the end of the resultset.
+                        # Stop fetching.
+                        break
+                    else:
+                        print(row)
+                        sleep(5)
+
+
         except Exception as ex:
             strex = str(ex).rstrip()
+            debug_print("Caught exception that stringifies as '{}'".format(strex))
+
             if strex == 'canceling statement due to lock timeout':
                 _print("VACUUM failed to lock table %table after {locktime} ms. Skipping to the next table...".format(table=table, locktime=args.lock_timeout))
-            else:
-                _print("VACUUMING %s failed." % table[0])
-                _print(strex)
-
-            if time.time() >= halt_time:
+            elif time.time() >= halt_time:
                 verbose_print("halted flexible_freeze due to enforced time limit")
-            sys.exit(1)
+            else:
+                _print("VACUUMing %s failed." % table)
+                _print(strex)
+                sys.exit(1)
 
         time.sleep(args.pause_time)
+
 
 conn.close()
 
