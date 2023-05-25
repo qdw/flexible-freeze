@@ -257,10 +257,7 @@ for db in dblist:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
                     n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
-                    pg_relation_size(relid) as table_bytes,
-                    pg_size_pretty(pg_relation_size(relid)) as size_pretty,
-                    pg_total_relation_size(relid) as total_bytes,
-                    pg_size_pretty(pg_total_relation_size(relid)) as total_size_pretty
+                    pg_relation_size(relid) as table_bytes
                 FROM pg_stat_user_tables
                 WHERE n_dead_tup > 100
                 AND ( (now() - last_autovacuum) > INTERVAL '1 hour'
