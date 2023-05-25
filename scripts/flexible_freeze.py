@@ -249,13 +249,18 @@ for db in dblist:
     cur = conn.cursor()
     cur.execute("SET vacuum_cost_delay = {0}".format(args.costdelay))
     cur.execute("SET vacuum_cost_limit = {0}".format(args.costlimit))
+    if args.verbose:
+        cur.execute("SET client_min_messages = debug")
     
     # if vacuuming, get list of top tables to vacuum
     if args.skip_freeze:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
                     n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
-                    pg_relation_size(relid) as table_bytes
+                    pg_relation_size(relid) as table_bytes,
+                    pg_size_pretty(pg_relation_size(relid)) as size_pretty,
+                    pg_total_relation_size(relid) as total_bytes,
+                    pg_size_pretty(pg_total_relation_size(relid)) as total_size_pretty
                 FROM pg_stat_user_tables
                 WHERE n_dead_tup > 100
                 AND ( (now() - last_autovacuum) > INTERVAL '1 hour'
@@ -263,7 +268,7 @@ for db in dblist:
                 AND ( (now() - last_vacuum) > INTERVAL '1 hour'
                     OR last_vacuum IS NULL )
             )
-            SELECT full_table_name, size_pretty
+            SELECT full_table_name
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes >= {0} * 2 ^ 20
@@ -272,12 +277,9 @@ for db in dblist:
     # if freezing, get list of top tables to freeze
     # includes TOAST tables in case the toast table has older rows
         tabquery = """WITH tabfreeze AS (
-                SELECT pg_class.oid::regclass AS full_table_name, -- [0]
-                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age, -- [1]
-                pg_relation_size(pg_class.oid) as table_bytes, -- [2]
-                pg_size_pretty(pg_relation_size(pg_class.oid)) as size_pretty, -- [3]
-                pg_size_pretty(pg_relation_size(pg_class.oid)) as total_size_pretty, -- [4]
-                pg_class.reltuples AS estimated_rows -- [5]
+                SELECT pg_class.oid::regclass AS full_table_name,
+                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
+                pg_relation_size(pg_class.oid) as table_bytes
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
@@ -285,7 +287,7 @@ for db in dblist:
                 AND nspname NOT LIKE 'pg_temp%'
                 AND pg_class.relkind = 'r'
             )
-            SELECT full_table_name, freeze_age, table_bytes, size_pretty, total_size_pretty, estimated_rows
+            SELECT full_table_name
             FROM tabfreeze
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
@@ -317,9 +319,9 @@ for db in dblist:
             debug_print("examining table {t} (xid age: {a}  heap size: {s}  row estimate: {r})".format(t=table, a=table_resultset[i][1], s=table_resultset[i][2], r=table_resultset[i][4]))
 
         if db in database_table_map and table in database_table_map[db]:
-            verbose_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
+            debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
             continue
-        # check time; if overtime, exit
+    # check time; if overtime, exit
         elif args.tables_to_exclude and (table in args.tables_to_exclude):
             verbose_print(
                 "skipping table {t} per --exclude-table argument".format(t=table))
@@ -346,19 +348,6 @@ for db in dblist:
         
         exquery += '"%s"' % table
 
-        vac_args = []
-        if args.verbose:
-            vac_args.append("VERBOSE")
-        if not args.skip_freeze:
-            vac_args.append("FREEZE")
-        if not args.skip_analyze:
-            vac_args.append("ANALYZE")
-
-
-        exquery = "VACUUM ({vargs}) {table}".format(
-            table=table,
-            vargs = ", ".join(vac_args))
-        
         verbose_print("%s in database %s" % (exquery, db,))
         excur = conn.cursor()
 
@@ -374,35 +363,19 @@ for db in dblist:
 
                 excur.execute(exquery)
 
-                # Print query rows *and* notices until there are no more of either.
-                prev_notice = None
-                while True:
-                    prev_notice = print_any_notices(conn, prev_notice)
-                    row = cur.fetchone()
-                    if not row:
-                        # A false value means we've reached the end of the resultset.
-                        # Stop fetching.
-                        break
-                    else:
-                        print(row)
-                        sleep(5)
-
-
         except Exception as ex:
             strex = str(ex).rstrip()
-            debug_print("Caught exception that stringifies as '{}'".format(strex))
-
             if strex == 'canceling statement due to lock timeout':
                 _print("VACUUM failed to lock table %table after {locktime} ms. Skipping to the next table...".format(table=table, locktime=args.lock_timeout))
-            elif time.time() >= halt_time:
-                verbose_print("halted flexible_freeze due to enforced time limit")
             else:
-                _print("VACUUMing %s failed." % table)
+                _print("VACUUMING %s failed." % table[0])
                 _print(strex)
-                sys.exit(1)
+
+            if time.time() >= halt_time:
+                verbose_print("halted flexible_freeze due to enforced time limit")
+            sys.exit(1)
 
         time.sleep(args.pause_time)
-
 
 conn.close()
 
