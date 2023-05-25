@@ -257,7 +257,10 @@ for db in dblist:
         tabquery = """WITH deadrow_tables AS (
                 SELECT relid::regclass as full_table_name,
                     n_dead_tup::numeric / NULLIF(n_dead_tup + n_live_tup, 0) as dead_pct,
-                    pg_relation_size(relid) as table_bytes
+                    pg_relation_size(relid) as table_bytes,
+                    pg_size_pretty(pg_relation_size(relid)) as size_pretty,
+                    pg_total_relation_size(relid) as total_bytes,
+                    pg_size_pretty(pg_total_relation_size(relid)) as total_size_pretty
                 FROM pg_stat_user_tables
                 WHERE n_dead_tup > 100
                 AND ( (now() - last_autovacuum) > INTERVAL '1 hour'
@@ -265,7 +268,7 @@ for db in dblist:
                 AND ( (now() - last_vacuum) > INTERVAL '1 hour'
                     OR last_vacuum IS NULL )
             )
-            SELECT full_table_name
+            SELECT full_table_name, size_pretty
             FROM deadrow_tables
             WHERE dead_pct > 0.05
             AND table_bytes >= {0} * 2 ^ 20
@@ -274,9 +277,12 @@ for db in dblist:
     # if freezing, get list of top tables to freeze
     # includes TOAST tables in case the toast table has older rows
         tabquery = """WITH tabfreeze AS (
-                SELECT pg_class.oid::regclass AS full_table_name,
-                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age,
-                pg_relation_size(pg_class.oid) as table_bytes
+                SELECT pg_class.oid::regclass AS full_table_name, -- [0]
+                greatest(age(pg_class.relfrozenxid), age(toast.relfrozenxid)) as freeze_age, -- [1]
+                pg_relation_size(pg_class.oid) as table_bytes, -- [2]
+                pg_size_pretty(pg_relation_size(pg_class.oid)) as size_pretty, -- [3]
+                pg_size_pretty(pg_relation_size(pg_class.oid)) as total_size_pretty, -- [4]
+                pg_class.reltuples AS estimated_rows -- [5]
             FROM pg_class JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
                 LEFT OUTER JOIN pg_class as toast
                     ON pg_class.reltoastrelid = toast.oid
@@ -284,7 +290,7 @@ for db in dblist:
                 AND nspname NOT LIKE 'pg_temp%'
                 AND pg_class.relkind = 'r'
             )
-            SELECT full_table_name
+            SELECT full_table_name, freeze_age, table_bytes, size_pretty, total_size_pretty, estimated_rows
             FROM tabfreeze
             WHERE freeze_age > {0}
             AND table_bytes >= {1} * 2 ^ 20
@@ -318,7 +324,6 @@ for db in dblist:
         if db in database_table_map and table in database_table_map[db]:
             debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
             continue
-    # check time; if overtime, exit
         elif args.tables_to_exclude and (table in args.tables_to_exclude):
             verbose_print(
                 "skipping table {t} per --exclude-table argument".format(t=table))
@@ -326,6 +331,7 @@ for db in dblist:
         else:
             verbose_print("processing table {t}".format(t=table))
 
+        # check time; if overtime, exit
         if time.time() >= halt_time:
             verbose_print("Reached time limit.  Exiting.")
             time_exit = True
@@ -359,6 +365,19 @@ for db in dblist:
                     excur.execute("SET lock_timeout = {}".format(args.lock_timeout))
 
                 excur.execute(exquery)
+                # Print query rows *and* notices until there are no more of either.
+                prev_notice = None
+                while True:
+                    prev_notice = print_any_notices(conn, prev_notice)
+                    row = cur.fetchone()
+                    if not row:
+                        # A false value means we've reached the end of the resultset.
+                        # Stop fetching.
+                        break
+                    else:
+                        print(row)
+                        sleep(5)
+
 
         except Exception as ex:
             strex = str(ex).rstrip()
