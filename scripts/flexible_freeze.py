@@ -63,8 +63,6 @@ parser.add_argument("-t", "--print-timestamps", action="store_true",
 parser.add_argument("--enforce-time", dest="enforcetime", action="store_true",
                     help="enforce time limit by terminating vacuum")
 parser.add_argument("-l", "--log", dest="logfile")
-parser.add_argument("--lock-timeout", type=int, dest="lock_timeout",
-                    help="If VACUUM can't get a lock on a table after this many milliseconds, give up and move on to the next table (prevents VACUUM from waiting on existing autovacuums)")
 parser.add_argument("-v", "--verbose", action="store_true",
                     dest="verbose")
 parser.add_argument("--debug", action="store_true",
@@ -78,7 +76,9 @@ parser.add_argument("-p", "--port", dest="dbport",
 parser.add_argument("-w", "--password", dest="dbpass",
                   help="database password")
 parser.add_argument("-st", "--table", dest="table",
-                  help="only process specified  table", default=False)
+                  help="only process specified table", default=False)
+parser.add_argument("-n", "--dry-run", dest="dry_run",
+                    help="don't really vacuum; just print info about what would have been vacuumed. Best used with --verbose and/or --debug", action="store_true")
 
 args = parser.parse_args()
 
@@ -286,8 +286,15 @@ for db in dblist:
          continue
          
       tablist = [args.table]
+
     # for each table in list
+    i = -1
     for table in tablist:
+        i += 1
+
+        if not args.skip_freeze:
+            debug_print("examining table {t} (xid age: {a}  heap size: {s}  row estimate: {r})".format(t=table, a=table_resultset[i][1], s=table_resultset[i][2], r=table_resultset[i][4]))
+
         if db in database_table_map and table in database_table_map[db]:
             debug_print("skipping table {t} in database {d} per --exclude-table-in-database argument".format(t=table, d=db))
             continue
@@ -309,8 +316,7 @@ for db in dblist:
             if args.enforcetime:
                 timeout_secs = int(halt_time - time.time()) + 30
                 timeout_query = """SET statement_timeout = '%ss'""" % timeout_secs
-            
-    # if not, vacuum or freeze
+
         exquery = "VACUUM "
         if not args.skip_freeze:
             exquery += "FREEZE "
@@ -323,25 +329,21 @@ for db in dblist:
         excur = conn.cursor()
 
         try:
-            if args.enforcetime:
-                excur.execute(timeout_query)
-            else:
-                excur.execute("SET statement_timeout = 0")
-                        
-            if args.lock_timeout:
-                excur.execute("SET lock_timeout = {}".format(args.lock_timeout))
+            if not args.dry_run:
+                if args.enforcetime:
+                    excur.execute(timeout_query)
+                else:
+                    excur.execute("SET statement_timeout = 0")
+                excur.execute(exquery)
 
-            excur.execute(exquery)
         except Exception as ex:
-            strex = str(ex).rstrip()
-            if strex == 'canceling statement due to lock timeout':
-                _print("VACUUM failed to lock table %table after {locktime} ms. Skipping to the next table...".format(table=table, locktime=args.lock_timeout))
-            else:
-                _print("VACUUMING %s failed." % table[0])
-                _print(strex)
-
+            _print("VACUUMing %s failed." % table)
+            _print(str(ex))
             if time.time() >= halt_time:
                 verbose_print("halted flexible_freeze due to enforced time limit")
+            else:
+                _print("VACUUMING %s failed." % table[0])
+                _print(str(ex))
             sys.exit(1)
 
         time.sleep(args.pause_time)
